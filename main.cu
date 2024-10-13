@@ -1,32 +1,32 @@
-﻿#include <cmath>
-#include <cuda_runtime.h>
+﻿#include <cuda_runtime.h>
 #include <curand_kernel.h>
-#include <limits.h>
+#include <fstream>
 #include <opencv2/core.hpp>
 #include <opencv2/core/matx.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/highgui.hpp>
-#include <stdio.h>
+#include <sstream>
+#include <string>
 
+#define CHANNELS 3 // RGB
 #define M_PI 3.141592f
 
 // Convert an index, image[channel][i][j] to flat[idx]
-__device__ __host__ int getIdx(int width, int channels, int channel, int i, int j) {
-    return j * width * channels + i * channels + channel;
+__device__ __host__ int getIdx(int width, int channel, int i, int j) {
+    return j * width * CHANNELS + i * CHANNELS + channel;
 }
 
-__global__ void gaussianBlurKernel(float* kernel, unsigned char* source, unsigned char* target, int width, int height, int channels) {
+__global__ void gaussianBlur(float* kernel, unsigned char* source, unsigned char* target, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x,
         y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x < width && y < height) {
-        int totalSize = width * height * channels;
-        for (int ch = 0;ch < channels;ch++) {
+        int totalSize = width * height * CHANNELS;
+        for (int ch = 0;ch < CHANNELS;ch++) {
             float weightedSum = 0;
             for (int i = -2;i <= 2;i++) {
                 for (int j = -2;j <= 2;j++) {
-                    int idx = (y + j) * width * channels + (x + i) * channels;
-                    idx += ch;
+                    int idx = getIdx(width, ch, x + i, y + j);
                     if (idx >= 0 && idx < totalSize) {
                         // Get the flat index + move indices from [-2,2] to [0,4] for the kernel
                         int kernelIdx = (i + 2) * 5 + (j + 2);
@@ -36,29 +36,28 @@ __global__ void gaussianBlurKernel(float* kernel, unsigned char* source, unsigne
                 }
             }
 
-            int centerIdx = y * width * channels + x * channels;
-            target[centerIdx + ch] = weightedSum;
+            target[getIdx(width, ch, x, y)] = weightedSum;
         }
     }
 }
 
-__global__ void grayscaleKernel(unsigned char* imageData, int width, int height, int channels) {
+__global__ void grayscale(unsigned char* imageData, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x < width && y < height) {
         int channelAvg = 0;
-        for (int ch = 0;ch < channels;ch++) {
-            channelAvg += (int)imageData[getIdx(width, channels, ch, x, y)];
+        for (int ch = 0;ch < CHANNELS;ch++) {
+            channelAvg += (int)imageData[getIdx(width, ch, x, y)];
         }
         channelAvg /= 3;
-        for (int ch = 0;ch < channels;ch++) {
-            imageData[getIdx(width, channels, ch, x, y)] = channelAvg;
+        for (int ch = 0;ch < CHANNELS;ch++) {
+            imageData[getIdx(width, ch, x, y)] = channelAvg;
         }
     }
 }
 
-__global__ void generateMagnitudesKernel(unsigned char* source, float* target, int width, int height, int channels) {
+__global__ void generateMagnitudes(unsigned char* source, float* target, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x,
         y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -73,13 +72,13 @@ __global__ void generateMagnitudesKernel(unsigned char* source, float* target, i
             {-1, -2, -1},
         };
 
-        int totalSize = width * height * channels;
-        for (int ch = 0;ch < channels;ch++) {
+        int totalSize = width * height * CHANNELS;
+        for (int ch = 0;ch < CHANNELS;ch++) {
             int Gx = 0,
                 Gy = 0;
             for (int i = -1;i <= 1;i++) {
                 for (int j = -1;j <= 1;j++) {
-                    int idx = getIdx(width, channels, ch, x + i, y + j);
+                    int idx = getIdx(width, ch, x + i, y + j);
                     if (idx >= 0 && idx < totalSize) {
                         // Move indices from [-1,1] to [0,2] for the kernel
                         Gx += (int)source[idx] * kernelX[i + 1][j + 1];
@@ -89,12 +88,37 @@ __global__ void generateMagnitudesKernel(unsigned char* source, float* target, i
             }
 
             float magnitude = sqrt((float)Gx * Gx + Gy * Gy);
-            target[getIdx(width, channels, ch, x, y)] = magnitude;
+            target[getIdx(width, ch, x, y)] = magnitude;
         }
     }
 }
 
-__global__ void sobelKernel(unsigned char* source, unsigned char* target, float* magnitudes, int width, int height, int channels) {
+__global__ void hysteresis(unsigned char* source, unsigned char* target, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) return;
+
+    int totalSize = width * height * CHANNELS;
+    for (int ch = 0;ch < CHANNELS;ch++) {
+        bool strongEdge = false;
+
+        for (int i = -1;i <= 1 && !strongEdge;i++) {
+            for (int j = -1;j <= 1;j++) {
+                int idx = getIdx(width, ch, x + i, y + j);
+                if (idx >= 0 && idx < totalSize && source[idx] == 255) {
+                    printf("%d\n", source[idx]);
+                    strongEdge = true;
+                    break;
+                }
+            }
+        }
+
+        target[getIdx(width, ch, x, y)] = strongEdge ? 255 : 0;
+    }
+}
+
+__global__ void sobel(unsigned char* source, unsigned char* target, float* magnitudes, int width, int height, float lowThreshold, float highThreshold) {
     int x = blockIdx.x * blockDim.x + threadIdx.x,
         y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -109,13 +133,13 @@ __global__ void sobelKernel(unsigned char* source, unsigned char* target, float*
             {-1, -2, -1},
         };
 
-        int totalSize = width * height * channels;
-        for (int ch = 0;ch < channels;ch++) {
+        int totalSize = width * height * CHANNELS;
+        for (int ch = 0;ch < CHANNELS;ch++) {
             int Gx = 0,
                 Gy = 0;
             for (int i = -1;i <= 1;i++) {
                 for (int j = -1;j <= 1;j++) {
-                    int idx = getIdx(width, channels, ch, x + i, y + j);
+                    int idx = getIdx(width, ch, x + i, y + j);
                     if (idx >= 0 && idx < totalSize) {
                         //TODO don't generate twice
                         // Move indices from [-1,1] to [0,2] for the kernel
@@ -139,28 +163,26 @@ __global__ void sobelKernel(unsigned char* source, unsigned char* target, float*
             // Compare with neighboring pixels
             float neighbor1, neighbor2;
             if (direction < 22.5f || direction >= 157.5f) { // North-South
-                neighbor1 = y > 0 ? magnitudes[getIdx(width, channels, ch, x, y - 1)] : 0.0f;
-                neighbor2 = y < height - 1 ? magnitudes[getIdx(width, channels, ch, x, y + 1)] : 0.0f;
+                neighbor1 = y > 0 ? magnitudes[getIdx(width, ch, x, y - 1)] : 0.0f;
+                neighbor2 = y < height - 1 ? magnitudes[getIdx(width, ch, x, y + 1)] : 0.0f;
             }
             else if (direction < 67.5f) { // North-East to South-West
-                neighbor1 = x > 0 && y > 0 ? magnitudes[getIdx(width, channels, ch, x - 1, y - 1)] : 0.0f;
-                neighbor2 = x < width - 1 && y < height - 1 ? magnitudes[getIdx(width, channels, ch, x + 1, y + 1)] : 0.0f;
+                neighbor1 = x > 0 && y > 0 ? magnitudes[getIdx(width, ch, x - 1, y - 1)] : 0.0f;
+                neighbor2 = x < width - 1 && y < height - 1 ? magnitudes[getIdx(width, ch, x + 1, y + 1)] : 0.0f;
             }
             else if (direction < 112.5f) { // East-West
-                neighbor1 = x > 0 ? magnitudes[getIdx(width, channels, ch, x - 1, y)] : 0.0f;
-                neighbor2 = x < width - 1 ? magnitudes[getIdx(width, channels, ch, x + 1, y)] : 0.0f;
+                neighbor1 = x > 0 ? magnitudes[getIdx(width, ch, x - 1, y)] : 0.0f;
+                neighbor2 = x < width - 1 ? magnitudes[getIdx(width, ch, x + 1, y)] : 0.0f;
             }
             else { // North-West to South-East
-                neighbor1 = x > 0 && y < height - 1 ? magnitudes[getIdx(width, channels, ch, x - 1, y + 1)] : 0.0f;
-                neighbor2 = x < width - 1 && y > 0 ? magnitudes[getIdx(width, channels, ch, x + 1, y - 1)] : 0.0f;
+                neighbor1 = x > 0 && y < height - 1 ? magnitudes[getIdx(width, ch, x - 1, y + 1)] : 0.0f;
+                neighbor2 = x < width - 1 && y > 0 ? magnitudes[getIdx(width, ch, x + 1, y - 1)] : 0.0f;
             }
 
             // Preserve the current pixel if it's the maximum
-            int idx = getIdx(width, channels, ch, x, y);
-            if (currentMagnitude > neighbor1 && currentMagnitude > neighbor2 && currentMagnitude > 100.0f) {
+            int idx = getIdx(width, ch, x, y);
+            if (currentMagnitude > neighbor1 && currentMagnitude > neighbor2) {
                 // Double thresholding
-                float lowThreshold = 0.1f * 255;
-                float highThreshold = 0.3f * 255;
                 if (currentMagnitude > highThreshold) {
                     target[idx] = 255; // Strong edge pixel
                 }
@@ -180,27 +202,42 @@ __global__ void sobelKernel(unsigned char* source, unsigned char* target, float*
 
 int main(int argc, char* argv[])
 {
-    const char* imagePath = NULL;
+    std::string imagePath = "image.jpg";
+    float lowThreshold = 0.2f,
+        highThreshold = 0.6f;
 
-    for (int i = 1; i < argc; i++) {
-        char* pos = strchr(argv[i], '=');
-        if (pos != NULL) {
-            if (strncmp(argv[i], "image", pos - argv[i]) == 0) {
-                imagePath = pos + 1;
-                continue;
+    std::string propPath = "config.properties";
+    std::ifstream propFile(propPath);
+    if (propFile.is_open()) {
+        std::string line;
+        while (std::getline(propFile, line)) {
+            size_t equalsPos = line.find('=');
+            if (equalsPos != std::string::npos) {
+                std::string key = line.substr(0, equalsPos);
+                std::string value = line.substr(equalsPos + 1);
+
+                if (key == "image") {
+                    imagePath = value;
+                }
+                else if (key == "lowThreshold") {
+                    lowThreshold = std::stof(value);
+                }
+                else if (key == "highThreshold") {
+                    highThreshold = std::stof(value);
+                }
             }
         }
+        
     }
-
-    if (imagePath == NULL) {
-        imagePath = "gizzard.jpg";
+    else {
+        printf("Could not open or find the properties file: %s\n", propPath);
     }
 
     cv::Mat image = cv::imread(imagePath, cv::IMREAD_ANYCOLOR);
 
     if (image.empty()) {
-        printf("Could not open or find the image\n");
-        return -1;
+        printf("Could not open or find the image: %s\n", imagePath);
+        return 1;
     }
 
     cv::namedWindow("Original", cv::WINDOW_AUTOSIZE);
@@ -222,7 +259,7 @@ int main(int argc, char* argv[])
     printf("gridSize: (%d,%d,%d)\n", gridSize.x, gridSize.y, gridSize.z);
 
     printf("Applying grayscale\n");
-    grayscaleKernel << <gridSize, blockSize >> > (deviceImageData, width, height, channels);
+    grayscale << <gridSize, blockSize >> > (deviceImageData, width, height);
 
     printf("Applying Gaussian blur\n");
     float kernel[5][5]{},
@@ -262,31 +299,38 @@ int main(int argc, char* argv[])
     cudaMalloc(&deviceImageDataCopy, imageDataSize);
     cudaMemcpy(deviceImageDataCopy, deviceImageData, imageDataSize, cudaMemcpyDeviceToDevice);
 
-    gaussianBlurKernel << <gridSize, blockSize >> > (deviceKernel, deviceImageDataCopy, deviceImageData, width, height, channels);
+    gaussianBlur << <gridSize, blockSize >> > (deviceKernel, deviceImageDataCopy, deviceImageData, width, height);
 
     cudaFree(deviceKernel);
 
     printf("Applying Sobel operator\n");
     float* deviceMagnitudes;
     cudaMalloc(&deviceMagnitudes, imageDataSize * sizeof(float));
-    generateMagnitudesKernel << <gridSize, blockSize >> > (deviceImageData, deviceMagnitudes, width, height, channels);
+    generateMagnitudes << <gridSize, blockSize >> > (deviceImageData, deviceMagnitudes, width, height);
+
+    lowThreshold *= 255;
+    highThreshold *= 255;
 
     cudaMemcpy(deviceImageDataCopy, deviceImageData, imageDataSize, cudaMemcpyDeviceToDevice);
-    sobelKernel << <gridSize, blockSize >> > (deviceImageDataCopy, deviceImageData, deviceMagnitudes, width, height, channels);
+    sobel << <gridSize, blockSize >> > (deviceImageDataCopy, deviceImageData, deviceMagnitudes, width, height, lowThreshold, highThreshold);
+
+    cudaFree(deviceMagnitudes);
+
+    cudaMemcpy(deviceImageDataCopy, deviceImageData, imageDataSize, cudaMemcpyDeviceToDevice);
+    hysteresis << <gridSize, blockSize >> > (deviceImageDataCopy, deviceImageData, width, height);
 
     cudaFree(deviceImageDataCopy);
-    cudaFree(deviceMagnitudes);
 
     unsigned char* hostImageData = (unsigned char*)malloc(imageDataSize);
     cudaMemcpy(hostImageData, deviceImageData, imageDataSize, cudaMemcpyDeviceToHost);
 
     cudaFree(deviceImageData);
 
-    cv::namedWindow("Canny edge detection", cv::WINDOW_AUTOSIZE);
     cv::Mat modifiedImage = cv::Mat(height, width, CV_8UC3, hostImageData);
+    cv::namedWindow("Canny edge detection", cv::WINDOW_AUTOSIZE);
     cv::imshow("Canny edge detection", modifiedImage);
     cv::waitKey(0);
 
-    //free(hostImageData);
+    free(hostImageData);
     return 0;
 }
