@@ -11,7 +11,13 @@
 #define CHANNELS 3 // RGB
 #define M_PI 3.141592f
 
-// Convert an index, image[channel][i][j] to flat[idx]
+using namespace cv;
+using namespace std;
+
+int lowThreshold = 20, // %
+    highThreshold = 50;
+
+// Convert an index, img[channel][i][j] to flat[idx]
 __device__ __host__ int getIdx(int width, int channel, int i, int j) {
     return j * width * CHANNELS + i * CHANNELS + channel;
 }
@@ -41,18 +47,18 @@ __global__ void gaussianBlur(float* kernel, unsigned char* source, unsigned char
     }
 }
 
-__global__ void grayscale(unsigned char* imageData, int width, int height) {
+__global__ void grayscale(unsigned char* imgData, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x < width && y < height) {
         int channelAvg = 0;
         for (int ch = 0;ch < CHANNELS;ch++) {
-            channelAvg += (int)imageData[getIdx(width, ch, x, y)];
+            channelAvg += (int)imgData[getIdx(width, ch, x, y)];
         }
         channelAvg /= 3;
         for (int ch = 0;ch < CHANNELS;ch++) {
-            imageData[getIdx(width, ch, x, y)] = channelAvg;
+            imgData[getIdx(width, ch, x, y)] = channelAvg;
         }
     }
 }
@@ -107,7 +113,6 @@ __global__ void hysteresis(unsigned char* source, unsigned char* target, int wid
             for (int j = -1;j <= 1;j++) {
                 int idx = getIdx(width, ch, x + i, y + j);
                 if (idx >= 0 && idx < totalSize && source[idx] == 255) {
-                    printf("%d\n", source[idx]);
                     strongEdge = true;
                     break;
                 }
@@ -200,57 +205,15 @@ __global__ void sobel(unsigned char* source, unsigned char* target, float* magni
     }
 }
 
-int main(int argc, char* argv[])
-{
-    std::string imagePath = "image.jpg";
-    float lowThreshold = 0.2f,
-        highThreshold = 0.6f;
+void renderModified(Mat& img) {
+    int width = img.cols,
+        height = img.rows,
+        channels = img.channels(); // Blue, green, red, etc.
 
-    std::string propPath = "config.properties";
-    std::ifstream propFile(propPath);
-    if (propFile.is_open()) {
-        std::string line;
-        while (std::getline(propFile, line)) {
-            size_t equalsPos = line.find('=');
-            if (equalsPos != std::string::npos) {
-                std::string key = line.substr(0, equalsPos);
-                std::string value = line.substr(equalsPos + 1);
-
-                if (key == "image") {
-                    imagePath = value;
-                }
-                else if (key == "lowThreshold") {
-                    lowThreshold = std::stof(value);
-                }
-                else if (key == "highThreshold") {
-                    highThreshold = std::stof(value);
-                }
-            }
-        }
-        
-    }
-    else {
-        printf("Could not open or find the properties file: %s\n", propPath);
-    }
-
-    cv::Mat image = cv::imread(imagePath, cv::IMREAD_ANYCOLOR);
-
-    if (image.empty()) {
-        printf("Could not open or find the image: %s\n", imagePath);
-        return 1;
-    }
-
-    cv::namedWindow("Original", cv::WINDOW_AUTOSIZE);
-    cv::imshow("Original", image);
-
-    int width = image.cols,
-        height = image.rows,
-        channels = image.channels(); // Blue, green, red, etc.
-
-    size_t imageDataSize = image.total() * image.channels();
-    unsigned char* deviceImageData;
-    cudaMalloc(&deviceImageData, imageDataSize);
-    cudaMemcpy(deviceImageData, image.data, imageDataSize, cudaMemcpyHostToDevice);
+    size_t imgDataSize = img.total() * img.channels();
+    unsigned char* deviceImgData;
+    cudaMalloc(&deviceImgData, imgDataSize);
+    cudaMemcpy(deviceImgData, img.data, imgDataSize, cudaMemcpyHostToDevice);
 
     dim3 blockSize(16, 16, 1);
     dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (height + blockSize.y - 1) / blockSize.y, 1);
@@ -259,7 +222,7 @@ int main(int argc, char* argv[])
     printf("gridSize: (%d,%d,%d)\n", gridSize.x, gridSize.y, gridSize.z);
 
     printf("Applying grayscale\n");
-    grayscale << <gridSize, blockSize >> > (deviceImageData, width, height);
+    grayscale << <gridSize, blockSize >> > (deviceImgData, width, height);
 
     printf("Applying Gaussian blur\n");
     float kernel[5][5]{},
@@ -295,42 +258,103 @@ int main(int argc, char* argv[])
     cudaMalloc(&deviceKernel, kernelDataSize);
     cudaMemcpy(deviceKernel, (float*)kernel, kernelDataSize, cudaMemcpyHostToDevice);
 
-    unsigned char* deviceImageDataCopy;
-    cudaMalloc(&deviceImageDataCopy, imageDataSize);
-    cudaMemcpy(deviceImageDataCopy, deviceImageData, imageDataSize, cudaMemcpyDeviceToDevice);
+    unsigned char* deviceImgDataCopy;
+    cudaMalloc(&deviceImgDataCopy, imgDataSize);
+    cudaMemcpy(deviceImgDataCopy, deviceImgData, imgDataSize, cudaMemcpyDeviceToDevice);
 
-    gaussianBlur << <gridSize, blockSize >> > (deviceKernel, deviceImageDataCopy, deviceImageData, width, height);
+    gaussianBlur << <gridSize, blockSize >> > (deviceKernel, deviceImgDataCopy, deviceImgData, width, height);
 
     cudaFree(deviceKernel);
 
     printf("Applying Sobel operator\n");
     float* deviceMagnitudes;
-    cudaMalloc(&deviceMagnitudes, imageDataSize * sizeof(float));
-    generateMagnitudes << <gridSize, blockSize >> > (deviceImageData, deviceMagnitudes, width, height);
+    cudaMalloc(&deviceMagnitudes, imgDataSize * sizeof(float));
+    generateMagnitudes << <gridSize, blockSize >> > (deviceImgData, deviceMagnitudes, width, height);
 
-    lowThreshold *= 255;
-    highThreshold *= 255;
-
-    cudaMemcpy(deviceImageDataCopy, deviceImageData, imageDataSize, cudaMemcpyDeviceToDevice);
-    sobel << <gridSize, blockSize >> > (deviceImageDataCopy, deviceImageData, deviceMagnitudes, width, height, lowThreshold, highThreshold);
+    cudaMemcpy(deviceImgDataCopy, deviceImgData, imgDataSize, cudaMemcpyDeviceToDevice);
+    sobel << <gridSize, blockSize >> > (deviceImgDataCopy, deviceImgData, deviceMagnitudes, width, height, lowThreshold / 100.0f * 255.0f, highThreshold / 100.0f * 255.0f);
 
     cudaFree(deviceMagnitudes);
 
-    cudaMemcpy(deviceImageDataCopy, deviceImageData, imageDataSize, cudaMemcpyDeviceToDevice);
-    hysteresis << <gridSize, blockSize >> > (deviceImageDataCopy, deviceImageData, width, height);
+    cudaMemcpy(deviceImgDataCopy, deviceImgData, imgDataSize, cudaMemcpyDeviceToDevice);
+    hysteresis << <gridSize, blockSize >> > (deviceImgDataCopy, deviceImgData, width, height);
 
-    cudaFree(deviceImageDataCopy);
+    cudaFree(deviceImgDataCopy);
 
-    unsigned char* hostImageData = (unsigned char*)malloc(imageDataSize);
-    cudaMemcpy(hostImageData, deviceImageData, imageDataSize, cudaMemcpyDeviceToHost);
+    unsigned char* hostImgData = (unsigned char*)malloc(imgDataSize);
+    cudaMemcpy(hostImgData, deviceImgData, imgDataSize, cudaMemcpyDeviceToHost);
 
-    cudaFree(deviceImageData);
+    cudaFree(deviceImgData);
 
-    cv::Mat modifiedImage = cv::Mat(height, width, CV_8UC3, hostImageData);
-    cv::namedWindow("Canny edge detection", cv::WINDOW_AUTOSIZE);
-    cv::imshow("Canny edge detection", modifiedImage);
-    cv::waitKey(0);
+    Mat modifiedImg = Mat(height, width, CV_8UC3, hostImgData);
+    imshow("Canny edge detection", modifiedImg);
 
-    free(hostImageData);
+    free(hostImgData);
+
+    printf("\n");
+}
+
+void onTrackbar(int, void* userdata) {
+    if (lowThreshold > highThreshold) {
+        printf("Let's be reasonable here\n");
+        highThreshold = lowThreshold;
+        setTrackbarPos("High threshold (%)", "Canny edge detection", highThreshold);
+    }
+
+    printf("Low threshold: %d\n", lowThreshold);
+    printf("High threshold: %d\n", highThreshold);
+
+    Mat* img = static_cast<Mat*>(userdata);
+    renderModified(*img);
+}
+
+int main(int argc, char* argv[])
+{
+    string imgPath = "image.jpg";
+    string propPath = "config.properties";
+    ifstream propFile(propPath);
+    if (propFile.is_open()) {
+        string line;
+        while (getline(propFile, line)) {
+            size_t equalsPos = line.find('=');
+            if (equalsPos != string::npos) {
+                string key = line.substr(0, equalsPos);
+                string value = line.substr(equalsPos + 1);
+
+                if (key == "image") {
+                    imgPath = value;
+                    break;
+                }
+            }
+        }
+    }
+    else {
+        printf("Could not open or find the properties file: %s\n", propPath);
+    }
+
+    Mat img = imread(imgPath, IMREAD_ANYCOLOR);
+
+    if (img.empty()) {
+        printf("Could not open or find the image: %s\n", imgPath);
+        return 1;
+    }
+
+    namedWindow("Original", WINDOW_AUTOSIZE);
+    imshow("Original", img);
+
+    namedWindow("Canny edge detection", WINDOW_AUTOSIZE);
+    createTrackbar("Low threshold (%)", "Canny edge detection", &lowThreshold, 100, onTrackbar, &img);
+    createTrackbar("High threshold (%)", "Canny edge detection", &highThreshold, 100, onTrackbar, &img);
+
+    // First render
+    onTrackbar(0, &img);
+
+    while (true) {
+        char key = (char)waitKey(100);
+        if (key == 'q') {
+            break;
+        }
+    }
+
     return 0;
 }
