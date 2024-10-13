@@ -9,13 +9,18 @@
 #include <string>
 
 #define CHANNELS 3 // RGB
+
 #define M_PI 3.141592f
+
+#define STRONG_EDGE 255
+#define WEAK_EDGE 128
+#define NO_EDGE 0
 
 using namespace cv;
 using namespace std;
 
 int lowThreshold = 20, // %
-    highThreshold = 50;
+    highThreshold = 60;
 
 // Convert an index, img[channel][i][j] to flat[idx]
 __device__ __host__ int getIdx(int width, int channel, int i, int j) {
@@ -63,7 +68,8 @@ __global__ void grayscale(unsigned char* imgData, int width, int height) {
     }
 }
 
-__global__ void generateMagnitudes(unsigned char* source, float* target, int width, int height) {
+// Calculate gradient magnitudes and directions here to avoid do it again in the Sobel operator kernel
+__global__ void intensityGradient(unsigned char* source, int width, int height, float* magnitudes, float* directions) {
     int x = blockIdx.x * blockDim.x + threadIdx.x,
         y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -93,8 +99,17 @@ __global__ void generateMagnitudes(unsigned char* source, float* target, int wid
                 }
             }
 
+            int idx = getIdx(width, ch, x, y),
+
             float magnitude = sqrt((float)Gx * Gx + Gy * Gy);
-            target[getIdx(width, ch, x, y)] = magnitude;
+            magnitudes[idx] = magnitude;
+
+            float direction = atan2f(Gy, Gx);
+            direction = direction * 180.0f / M_PI; // Convert to degrees
+            if (direction < 0.0f) {
+                direction += 180.0f;
+            }
+            directions[idx] = direction;
         }
     }
 }
@@ -107,66 +122,49 @@ __global__ void hysteresis(unsigned char* source, unsigned char* target, int wid
 
     int totalSize = width * height * CHANNELS;
     for (int ch = 0;ch < CHANNELS;ch++) {
-        bool strongEdge = false;
-
-        for (int i = -1;i <= 1 && !strongEdge;i++) {
-            for (int j = -1;j <= 1;j++) {
-                int idx = getIdx(width, ch, x + i, y + j);
-                if (idx >= 0 && idx < totalSize && source[idx] == 255) {
-                    strongEdge = true;
-                    break;
+        int idx = getIdx(width, ch, x, y);
+        if (source[idx] == STRONG_EDGE) {
+            target[idx] = STRONG_EDGE;  // Strong edge is retained
+        }
+        else if (source[idx] >= WEAK_EDGE) {
+            // Check if it is connected to any strong edge
+            bool connectedToStrongEdge = false;
+            for (int i = -1; i <= 1 && !connectedToStrongEdge; i++) {
+                for (int j = -1; j <= 1; j++) {
+                    int neighborIdx = getIdx(width, ch, x + i, y + j);
+                    if (neighborIdx >= 0 && neighborIdx < totalSize && source[neighborIdx] == STRONG_EDGE) {
+                        connectedToStrongEdge = true;
+                        break;
+                    }
                 }
             }
+            target[idx] = connectedToStrongEdge ? STRONG_EDGE : NO_EDGE;
         }
-
-        target[getIdx(width, ch, x, y)] = strongEdge ? 255 : 0;
+        else {
+            target[idx] = NO_EDGE;  // Suppress weak edges not connected to strong ones
+        }
     }
 }
 
-__global__ void sobel(unsigned char* source, unsigned char* target, float* magnitudes, int width, int height, float lowThreshold, float highThreshold) {
+__global__ void sobel(unsigned char* source, 
+                      unsigned char* target, 
+                      int width, 
+                      int height,
+                      float* magnitudes,
+                      float* directions,
+                      float lowThreshold, 
+                      float highThreshold) {
     int x = blockIdx.x * blockDim.x + threadIdx.x,
         y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x < width && y < height) {
-        int kernelX[3][3] = {
-            {1, 0, -1},
-            {2, 0, -2},
-            {1, 0, -1},
-        }, kernelY[3][3] = {
-            { 1,  2,  1},
-            { 0,  0,  0},
-            {-1, -2, -1},
-        };
+        for (int ch = 0;ch < CHANNELS;ch++) { 
+            int idx = getIdx(width, ch, x, y);
 
-        int totalSize = width * height * CHANNELS;
-        for (int ch = 0;ch < CHANNELS;ch++) {
-            int Gx = 0,
-                Gy = 0;
-            for (int i = -1;i <= 1;i++) {
-                for (int j = -1;j <= 1;j++) {
-                    int idx = getIdx(width, ch, x + i, y + j);
-                    if (idx >= 0 && idx < totalSize) {
-                        //TODO don't generate twice
-                        // Move indices from [-1,1] to [0,2] for the kernel
-                        Gx += (int)source[idx] * kernelX[i + 1][j + 1];
-                        Gy += (int)source[idx] * kernelY[i + 1][j + 1];
-                    }
-                }
-            }
-
-            // Intensity gradient
-            float currentMagnitude = sqrtf(Gx * Gx + Gy * Gy);
-
-            // Calculate the direction of the gradient
-            float direction = atan2f(Gy, Gx);
-            direction = direction * 180.0f / M_PI; // Convert to degrees
-            if (direction < 0.0f) {
-                direction += 180.0f;
-            }
-
-            // Non-maximum suppression
-            // Compare with neighboring pixels
-            float neighbor1, neighbor2;
+            // Non-maximum suppression, compare with neighboring pixels
+            float neighbor1,
+                neighbor2,
+                direction = directions[idx];
             if (direction < 22.5f || direction >= 157.5f) { // North-South
                 neighbor1 = y > 0 ? magnitudes[getIdx(width, ch, x, y - 1)] : 0.0f;
                 neighbor2 = y < height - 1 ? magnitudes[getIdx(width, ch, x, y + 1)] : 0.0f;
@@ -185,17 +183,17 @@ __global__ void sobel(unsigned char* source, unsigned char* target, float* magni
             }
 
             // Preserve the current pixel if it's the maximum
-            int idx = getIdx(width, ch, x, y);
+            float currentMagnitude = magnitudes[idx];
             if (currentMagnitude > neighbor1 && currentMagnitude > neighbor2) {
                 // Double thresholding
                 if (currentMagnitude > highThreshold) {
-                    target[idx] = 255; // Strong edge pixel
+                    target[idx] = STRONG_EDGE;
                 }
                 else if (currentMagnitude > lowThreshold) {
-                    target[idx] = 128; // Weak edge pixel
+                    target[idx] = WEAK_EDGE;
                 }
                 else {
-                    target[idx] = 0; // Suppressed pixel
+                    target[idx] = NO_EDGE; // Suppressed pixel
                 }
             }
             else {
@@ -206,6 +204,11 @@ __global__ void sobel(unsigned char* source, unsigned char* target, float* magni
 }
 
 void renderModified(Mat& img) {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
     int width = img.cols,
         height = img.rows,
         channels = img.channels(); // Blue, green, red, etc.
@@ -218,13 +221,14 @@ void renderModified(Mat& img) {
     dim3 blockSize(16, 16, 1);
     dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (height + blockSize.y - 1) / blockSize.y, 1);
 
-    printf("blockSize: (%d,%d,%d)\n", blockSize.x, blockSize.y, blockSize.z);
-    printf("gridSize: (%d,%d,%d)\n", gridSize.x, gridSize.y, gridSize.z);
+    //TODO log once
+    //printf("blockSize: (%d,%d,%d)\n", blockSize.x, blockSize.y, blockSize.z);
+    //printf("gridSize: (%d,%d,%d)\n", gridSize.x, gridSize.y, gridSize.z);
 
-    printf("Applying grayscale\n");
     grayscale << <gridSize, blockSize >> > (deviceImgData, width, height);
 
-    printf("Applying Gaussian blur\n");
+    // Gaussian blur
+    //TODO calculate once
     float kernel[5][5]{},
         kernelSum = .0f,
         sigma = .75f;
@@ -245,13 +249,14 @@ void renderModified(Mat& img) {
         }
     }
 
-    printf("Gaussian blur kernel:\n");
+    //TODO print once
+    /*printf("Gaussian blur kernel:\n");
     for (int i = 0;i < 5;i++) {
         for (int j = 0;j < 5;j++) {
             printf("%f ", kernel[i][j]);
         }
         printf("\n");
-    }
+    }*/
 
     int kernelDataSize = 5 * 5 * sizeof(float);
     float* deviceKernel;
@@ -266,16 +271,26 @@ void renderModified(Mat& img) {
 
     cudaFree(deviceKernel);
 
-    printf("Applying Sobel operator\n");
-    float* deviceMagnitudes;
+    // Intensity gradient
+    float *deviceMagnitudes, *deviceDirections;
     cudaMalloc(&deviceMagnitudes, imgDataSize * sizeof(float));
-    generateMagnitudes << <gridSize, blockSize >> > (deviceImgData, deviceMagnitudes, width, height);
+    cudaMalloc(&deviceDirections, imgDataSize * sizeof(float));
+    intensityGradient << <gridSize, blockSize >> > (deviceImgData, width, height, deviceMagnitudes, deviceDirections);
 
     cudaMemcpy(deviceImgDataCopy, deviceImgData, imgDataSize, cudaMemcpyDeviceToDevice);
-    sobel << <gridSize, blockSize >> > (deviceImgDataCopy, deviceImgData, deviceMagnitudes, width, height, lowThreshold / 100.0f * 255.0f, highThreshold / 100.0f * 255.0f);
+    sobel << <gridSize, blockSize >> > (deviceImgDataCopy, 
+                                        deviceImgData, 
+                                        width, 
+                                        height, 
+                                        deviceMagnitudes, 
+                                        deviceDirections, 
+                                        lowThreshold / 100.0f * 255.0f, 
+                                        highThreshold / 100.0f * 255.0f);
 
     cudaFree(deviceMagnitudes);
+    cudaFree(deviceDirections);
 
+    // Hysteresis and copy to host
     cudaMemcpy(deviceImgDataCopy, deviceImgData, imgDataSize, cudaMemcpyDeviceToDevice);
     hysteresis << <gridSize, blockSize >> > (deviceImgDataCopy, deviceImgData, width, height);
 
@@ -285,24 +300,32 @@ void renderModified(Mat& img) {
     cudaMemcpy(hostImgData, deviceImgData, imgDataSize, cudaMemcpyDeviceToHost);
 
     cudaFree(deviceImgData);
+    
+    // Measure time
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Low threshold: %d, high: %d, took %dms\n", lowThreshold, highThreshold, (int)milliseconds);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    // Show
     Mat modifiedImg = Mat(height, width, CV_8UC3, hostImgData);
     imshow("Canny edge detection", modifiedImg);
 
     free(hostImgData);
-
-    printf("\n");
 }
 
 void onTrackbar(int, void* userdata) {
     if (lowThreshold > highThreshold) {
         printf("Let's be reasonable here\n");
         highThreshold = lowThreshold;
-        setTrackbarPos("High threshold (%)", "Canny edge detection", highThreshold);
+        setTrackbarPos("High (%)", "Canny edge detection", highThreshold);
+        return;
     }
-
-    printf("Low threshold: %d\n", lowThreshold);
-    printf("High threshold: %d\n", highThreshold);
 
     Mat* img = static_cast<Mat*>(userdata);
     renderModified(*img);
@@ -343,8 +366,8 @@ int main(int argc, char* argv[])
     imshow("Original", img);
 
     namedWindow("Canny edge detection", WINDOW_AUTOSIZE);
-    createTrackbar("Low threshold (%)", "Canny edge detection", &lowThreshold, 100, onTrackbar, &img);
-    createTrackbar("High threshold (%)", "Canny edge detection", &highThreshold, 100, onTrackbar, &img);
+    createTrackbar("Low (%)", "Canny edge detection", &lowThreshold, 100, onTrackbar, &img);
+    createTrackbar("High (%)", "Canny edge detection", &highThreshold, 100, onTrackbar, &img);
 
     // First render
     onTrackbar(0, &img);
