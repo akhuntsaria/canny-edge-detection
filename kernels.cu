@@ -72,16 +72,15 @@ __global__ void hysteresis(unsigned char* img, int width, int height) {
     }
 }
 
-// Calculate gradient magnitudes and directions here to avoid doing it again in the final stage
 __global__ void intensityGradient(unsigned char* img, int width, int height, float* magnitudes, float* directions) {
     int x = blockIdx.x * blockDim.x + threadIdx.x,
         y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
 
     int kernelX[3][3] = {
-            {1, 0, -1},
-            {2, 0, -2},
-            {1, 0, -1},
+        {1, 0, -1},
+        {2, 0, -2},
+        {1, 0, -1},
     }, kernelY[3][3] = {
         { 1,  2,  1},
         { 0,  0,  0},
