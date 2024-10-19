@@ -28,7 +28,7 @@ __global__ void gaussianBlur(float* kernel, unsigned char* source, unsigned char
     target[y * width + x] = weightedSum;
 }
 
-__global__ void grayscale(unsigned char* rgbData, int width, int height, unsigned char* grayData) {
+__global__ void grayscale(unsigned char* rgbData, unsigned char* grayData, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
