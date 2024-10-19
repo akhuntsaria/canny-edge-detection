@@ -122,6 +122,7 @@ void canny(Mat& img) {
     }
 }
 
+// Common for all kernel executions
 void initGauss() {
     float kernel[5][5]{},
         sum = .0f,
@@ -284,9 +285,8 @@ int main()
         printf("Could not open or find the properties file: %s\n", propPath.c_str());
     }
 
-    initGauss(); // Common for all kernel executions
+    initGauss();
 
-    // The meat
     if (media == "image") {
         handleImage(inPath);
     }
