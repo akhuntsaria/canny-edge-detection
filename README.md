@@ -6,9 +6,14 @@ Canny edge detection implemented in CUDA C/C++. Supports images and video. OpenC
 Comparison with an example from the [article](https://en.wikipedia.org/wiki/Canny_edge_detector#):
 ![image demo](wiki.jpg)
 
-# Configuration
+# Configure
 * headless - `true` for just writing output files, `false` for GUI
 * media - `image` or `video`
 * in - input path
 * lowThreshold, highThreshold - percentages for retaining or discarding edges based on pixel values
+
+# Compile
+```sh
+nvcc -arch=sm_89 -O3 -o canny main.cu kernels.cu `pkg-config --cflags --libs opencv4`
+```
 
