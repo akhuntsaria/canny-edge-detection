@@ -14,6 +14,6 @@ Comparison with an example from the [article](https://en.wikipedia.org/wiki/Cann
 
 # Compile
 ```sh
-nvcc -arch=sm_89 -O3 -o canny main.cu kernels.cu `pkg-config --cflags --libs opencv4`
+nvcc -arch=sm_89 -O3 -o canny *.cu `pkg-config --cflags --libs opencv4`
 ```
 
